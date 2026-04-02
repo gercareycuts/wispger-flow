@@ -1,0 +1,76 @@
+name: Build WispGer Flow
+
+on:
+  push:
+    branches: [cloud-groq]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: WispGer-Flow-Windows
+          - os: macos-latest
+            artifact: WispGer-Flow-macOS
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install customtkinter pyperclip requests sounddevice pynput pillow pyinstaller
+
+      - name: Generate emoji PNGs
+        run: |
+          python -c "
+          from PIL import Image, ImageDraw, ImageFont
+          import os, sys
+          os.makedirs('fonts', exist_ok=True)
+          if sys.platform == 'win32':
+              font_path = 'seguiemj.ttf'
+          else:
+              font_path = '/System/Library/Fonts/Apple Color Emoji.ttc'
+          try:
+              font = ImageFont.truetype(font_path, 32)
+              for name, char in [('fire', '\U0001f525'), ('rocket', '\U0001f680'), ('trophy', '\U0001f3c6')]:
+                  img = Image.new('RGBA', (40, 40), (0, 0, 0, 0))
+                  draw = ImageDraw.Draw(img)
+                  draw.text((4, 0), char, font=font, embedded_color=True)
+                  img.save(f'fonts/{name}.png')
+          except Exception as e:
+              print(f'Emoji generation failed: {e}, using fallback')
+              for name in ['fire', 'rocket', 'trophy']:
+                  img = Image.new('RGBA', (40, 40), (0, 0, 0, 0))
+                  img.save(f'fonts/{name}.png')
+          "
+
+      - name: Build with PyInstaller
+        run: pyinstaller wispger_flow.spec --noconfirm
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path "dist/WispGer Flow/*" -DestinationPath "WispGer-Flow-Windows.zip"
+        shell: pwsh
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          hdiutil create -volname "WispGer Flow" -srcfolder "WispGer Flow.app" -ov -format UDZO "../WispGer-Flow-macOS.dmg"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            WispGer-Flow-Windows.zip
+            WispGer-Flow-macOS.dmg
+          if-no-files-found: ignore

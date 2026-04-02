@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """WispGer Flow — Voice to text, refined. Hold Ctrl+Win to record, release to paste."""
 
-import array, ctypes, io, json, math, os, sys, threading, time, tkinter as tk, wave
+import array, io, json, math, os, re, struct, subprocess, sys, threading, time, tkinter as tk, wave
 from datetime import datetime
 from pathlib import Path
 
@@ -9,13 +9,33 @@ import customtkinter as ctk
 import pyperclip, requests, sounddevice as sd
 from pynput import keyboard
 
+# -- Platform --
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+
+if IS_WIN:
+    import ctypes
+
 # -- Paths & Font --
 APP_DIR = Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).parent
-CFG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "WispGer"
+if IS_WIN:
+    CFG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "WispGer"
+elif IS_MAC:
+    CFG_DIR = Path.home() / "Library" / "Application Support" / "WispGer"
+else:
+    CFG_DIR = Path.home() / ".config" / "WispGer"
 CFG_FILE = CFG_DIR / "config.json"
-for ttf in (APP_DIR / "fonts").glob("*.ttf"):
-    ctypes.windll.gdi32.AddFontResourceExW(str(ttf), 0x10, 0)
-F = "Poppins"
+
+# Load Poppins font (platform-specific)
+if IS_WIN:
+    for ttf in (APP_DIR / "fonts").glob("*.ttf"):
+        ctypes.windll.gdi32.AddFontResourceExW(str(ttf), 0x10, 0)
+    F = "Poppins"
+elif IS_MAC:
+    # macOS loads .ttf from the app bundle automatically via Tk; fall back to system font
+    F = "Poppins" if (APP_DIR / "fonts" / "Poppins-Regular.ttf").exists() else "SF Pro"
+else:
+    F = "Poppins"
 
 # -- Theme --
 DARK = {"bg": "#0f0f1a", "bg2": "#161625", "card": "#1c1c30", "txt": "#e8e8f0",
@@ -25,14 +45,34 @@ LIGHT = {"bg": "#f0f0f5", "bg2": "#e4e4ec", "card": "#ffffff", "txt": "#1a1a2e",
 ACCENT, ACCENTH, TEAL, GREEN = "#e67e22", "#f39c12", "#00b894", "#2ecc71"
 RED, REDDIM, AMBER = "#ff4757", "#cc3040", "#ffa502"
 
-# -- DPI --
-try: ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception: pass
-_scr = ctypes.windll.user32.GetSystemMetrics
+# -- DPI & Screen --
+if IS_WIN:
+    try: ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception: pass
+    def _screen_size(): return ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1)
+else:
+    def _screen_size():
+        # On macOS/Linux, use a temporary Tk to get screen size (cached after first call)
+        if not hasattr(_screen_size, "_c"):
+            try:
+                r = tk.Tk(); r.withdraw()
+                _screen_size._c = (r.winfo_screenwidth(), r.winfo_screenheight()); r.destroy()
+            except Exception: _screen_size._c = (1920, 1080)
+        return _screen_size._c
 
 # -- API --
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3-turbo"
+WHISPER_PROMPT = "Hello, how are you? I'm doing well. Yes, that sounds great! Let me think about it. Okay, I'll do that."
+
+# -- Whisper hallucination filter (common outputs on silence) --
+_HALLUCINATIONS = {
+    "thank you", "thanks", "thank you.", "thanks.", "thank you for watching",
+    "thanks for watching", "thanks for watching.", "thank you for watching.",
+    "subscribe", "like and subscribe", "please subscribe",
+    "bye", "bye.", "goodbye", "goodbye.", "you", "you.",
+    "the end", "the end.", "",
+}
 
 # -- Fillers & Achievements --
 FILLERS = {"um","uh","er","ah","like","you know","i mean","sort of","kind of",
@@ -45,17 +85,17 @@ ACHIEVEMENTS = [
     ("w20000","words",20000,"\U0001f4da","Novelist","That's a short book right there","gold"),
     ("w30000","words",30000,"\U0001f3c6","Marathon Speaker","Do you ever stop talking?","diamond"),
     ("w100000","words",100000,"\U0001f30d","War & Peace","Tolstoy would be proud","diamond"),
-    ("t25","txns",25,"\U0001f3af","Getting Started","Welcome aboard","bronze"),
-    ("t100","txns",100,"\u26a1","Power User","Keyboard? Never heard of it","silver"),
-    ("t250","txns",250,"\U0001f4af","Centurion","A hundred and counting","gold"),
-    ("t500","txns",500,"\U0001f916","Voice Addict","Your keyboard is collecting dust","diamond"),
-    ("like500","like",500,"\U0001f644","Like, Totally","Are you in high school?","roast"),
+    ("t50","txns",50,"\U0001f3af","Getting Started","Welcome aboard","bronze"),
+    ("t100","txns",100,"\U0001f4af","Centurion","A hundred and counting","silver"),
+    ("t500","txns",500,"\u26a1","Power User","Keyboard? Never heard of it","gold"),
+    ("t1000","txns",1000,"\U0001f916","Voice Addict","Your keyboard is collecting dust","diamond"),
+    ("like100","like",100,"\U0001f644","Like, Totally","Are you in high school?","roast"),
     ("um200","um",200,"\U0001f914","The Thinker","Uhhhhhhhhhhhh...","roast"),
-    ("dup3","dupes",3,"\U0001f99c","Broken Record","You said the same thing 3x","roast"),
+    ("dup15","dupes",15,"\U0001f99c","Broken Record","You said the same thing 15x","roast"),
     ("night10","night",10,"\U0001f319","Night Owl","Go to bed already","roast"),
-    ("speed200","speed",1,"\U0001f407","Speed Demon","Slow down, auctioneer","roast"),
-    ("tiny5","tiny",5,"\U0001f90f","One Word Wonder","Could've just typed it","roast"),
-    ("long60","long",1,"\U0001f4d6","Monologue King","Sir, this is a Wendy's","roast"),
+    ("speed100","speed",1,"\U0001f407","Speed Demon","Slow down, auctioneer","roast"),
+    ("tiny50","tiny",50,"\U0001f90f","One Word Wonder","Could've just typed it","roast"),
+    ("long30","long",1,"\U0001f4d6","Monologue King","Sir, this is a Wendy's","roast"),
     ("morning10","morning",10,"\u2615","Morning Person","Rise and grind","roast"),
 ]
 TIER_COL = {"bronze":"#cd7f32","silver":"#8a8a9a","gold":"#f39c12","diamond":TEAL,"roast":RED}
@@ -107,11 +147,109 @@ ACH_HINTS = {
     "um": "Say 'um' or 'uh' {target:,} times across your transcriptions",
     "dupes": "Transcribe the same thing {target} times",
     "night": "Transcribe after midnight {target} times",
-    "speed": "Transcribe 200+ words in a single recording",
+    "speed": "Transcribe 100+ words in a single recording",
     "tiny": "Transcribe just 1 word {target} times",
-    "long": "Record for 60+ seconds in a single session",
+    "long": "Record for 30+ seconds in a single session",
     "morning": "Transcribe before 7am {target} times",
 }
+
+# -- Text cleanup --
+_VOWELS = set("aeiouAEIOU")
+_CONSONANT_SOUND = {"one","once","uni","unit","united","unique","union","university",
+                    "uniform","unicorn","universal","use","used","useful","user",
+                    "usual","usually","europe","european","ufo"}
+_SILENT_H_SKIP = {"have","had","has","he","her","him","his","how","here"}
+
+# Words that typically start a new sentence (used for punctuation insertion)
+_SENTENCE_STARTERS = {"So","But","However","Also","Then","Now","Well",
+                      "Actually","Anyway","Besides","Furthermore","Meanwhile",
+                      "Nevertheless","Otherwise","Therefore","Instead","Finally",
+                      "Basically","Honestly","Look","Listen","Hey","Okay","OK","Yeah","Yes","No"}
+# Words that signal a question
+_QUESTION_STARTERS = {"who","what","where","when","why","how","is","are","was","were",
+                      "do","does","did","can","could","would","should","will","shall",
+                      "have","has","had","am","isn't","aren't","wasn't","weren't",
+                      "don't","doesn't","didn't","can't","couldn't","wouldn't","shouldn't"}
+
+def _fix_article(m):
+    article, space, word = m.group(1), m.group(2), m.group(3)
+    wl = word.lower()
+    vowel = wl[0] in _VOWELS if wl else False
+    if any(wl.startswith(x) for x in _CONSONANT_SOUND): vowel = False
+    if wl.startswith("h") and len(wl)>1 and wl[1] in _VOWELS and wl not in _SILENT_H_SKIP: vowel = True
+    correct = "an" if vowel else "a"
+    if article[0].isupper(): correct = correct.capitalize()
+    return correct + space + word
+
+def _add_punctuation(text):
+    """Insert periods and commas where Whisper omitted them."""
+    words = text.split()
+    if len(words) < 2:
+        # Single word or empty — just add period if missing
+        if text and text[-1].isalpha(): text += "."
+        return text
+
+    result = [words[0]]
+    since_punct = 1  # words since last punctuation
+
+    for i in range(1, len(words)):
+        prev = result[-1]
+        curr = words[i]
+        prev_ended = prev[-1] in ".!?," if prev else False
+        if prev_ended: since_punct = 0
+
+        # Insert period before sentence-starting words, but only if we're 3+ words
+        # into a clause (avoids breaking short phrases like "and So on")
+        if not prev_ended and curr in _SENTENCE_STARTERS and since_punct >= 3:
+            result[-1] = prev + "."
+            since_punct = 0
+
+        # Insert comma before subordinating conjunctions in longer clauses
+        elif not prev_ended and curr.lower() in ("because","although","since","unless","whereas") and since_punct >= 3:
+            result[-1] = prev + ","
+
+        result.append(curr)
+        since_punct += 1
+
+    text = " ".join(result)
+
+    # Add period at end if missing
+    if text and text[-1].isalpha():
+        text += "."
+
+    # Detect questions: if first word is a question word, swap trailing period for ?
+    first = text.split()[0].lower().rstrip(".,!?") if text else ""
+    if first in _QUESTION_STARTERS and text.endswith("."):
+        text = text[:-1] + "?"
+
+    return text
+
+def clean_pipeline(text):
+    # Remove repeated consecutive phrases (2-5 word ngrams)
+    for n in range(5, 1, -1):
+        words = text.split()
+        i = 0
+        while i + 2*n <= len(words):
+            if [w.lower() for w in words[i:i+n]] == [w.lower() for w in words[i+n:i+2*n]]:
+                words = words[:i+n] + words[i+2*n:]
+            else: i += 1
+        text = " ".join(words)
+    # Insert punctuation where missing
+    text = _add_punctuation(text)
+    # Capitalise after sentence-ending punctuation
+    text = re.sub(r'([.!?])\s+([a-z])', lambda m: m.group(1)+" "+m.group(2).upper(), text)
+    if text and text[0].islower(): text = text[0].upper() + text[1:]
+    # Correct a/an
+    text = re.sub(r'\b(A|a|An|an)\b(\s+)(\w+)', _fix_article, text)
+    # Space after punctuation if missing
+    text = re.sub(r'([.!?])([A-Za-z])', r'\1 \2', text)
+    # Collapse double spaces
+    return re.sub(r'  +', ' ', text).strip()
+
+def prep_for_paste(text):
+    if not text or text[0] in ".!?,;:'\"-": return text
+    return " " + text
+
 
 # -- Config --
 def _load_cfg():
@@ -123,8 +261,38 @@ def _save_cfg(data):
     cfg = _load_cfg(); cfg.update(data)
     CFG_FILE.write_text(json.dumps(cfg))
 
+# -- Common English words (filtered out of voice profile) --
+COMMON_WORDS = frozenset(
+    "a about after again all also am an and any are as at back be because been before being below between both but by "
+    "came can come could day did do does done down each even few first for from get go going good got great had has have "
+    "he her here him his how i if in into is it its just know last let like long look made make many may me might more "
+    "most much must my new no nor not now of off on one only or other our out over own part per put quite really right "
+    "said same say see she should show side since so some something still such take tell than that the their them then "
+    "there these they thing think this those through time to too two under up upon us use used using very want was way "
+    "we well were what when where which while who why will with without word work would year yes yet you your "
+    "able about above actually after again against ago ahead almost already although always among another "
+    "around away bad before began begin behind believe best better big bit bring brought called certain "
+    "change children city close company country course cut different doing door early end enough ever every "
+    "example face fact family far feel felt find found four full gave give given goes gone great group hand "
+    "head hear help high home house however important keep kind knew large last later least left less life "
+    "line little live long looked making man men might mind money morning move mr mrs never next night nothing "
+    "number often old once open order place play point possible power probably problem quite ran read real "
+    "room run saw school second set several shall short small started state still stop story sure system "
+    "taken talk tell thought three together told took top turn under until upon water whole world write young".split()
+)
+
+def _default_voice_profile():
+    return {"vocab":{},"phrases":{},"corrections":{},"style_notes":"","prompt_override":""}
+
+def _apply_corrections(text, corrections):
+    """Apply user-defined word corrections after clean_pipeline."""
+    for wrong, right in corrections.items():
+        text = re.sub(r'\b' + re.escape(wrong) + r'\b', right, text, flags=re.IGNORECASE)
+    return text
+
 def _default_stats():
     return {"total_words":0,"total_txns":0,"total_secs":0.0,"fillers":0,
+            "filler_breakdown":{},
             "like_count":0,"um_count":0,"dupes":0,"night_count":0,
             "speed_count":0,"tiny_count":0,"long_count":0,"morning_count":0,
             "first_use":None,"unlocked":[]}
@@ -199,7 +367,9 @@ class RecordingOverlay(tk.Toplevel):
         self._c.pack(fill="both", expand=True); self.withdraw()
 
     def set_theme(self, t): self._fill = t["overlay"]
-    def _pos(self): self.geometry(f"{self.W}x{self.H}+{(_scr(0)-self.W)//2}+{_scr(1)-self.H-50}")
+    def _pos(self):
+        sw, sh = _screen_size()
+        self.geometry(f"{self.W}x{self.H}+{(sw-self.W)//2}+{sh-self.H-50}")
 
     def _rr(self, x0, y0, x1, y1, r, **kw):
         c = self._c
@@ -290,12 +460,14 @@ class WispGerFlow(ctk.CTk):
         self._stats = {**_default_stats(), **cfg.get("stats",{})}
         if not self._stats["first_use"]: self._stats["first_use"] = datetime.now().isoformat()
         self._last_texts = []
+        self._vp = {**_default_voice_profile(), **cfg.get("voice_profile",{})}
         self._rec, self._kb = AudioRecorder(), keyboard.Controller()
         self._recording, self._ctrl, self._win, self._t0 = False, False, False, None
         self._key_lock = threading.Lock()
         self._cards, self._lock, self._view = [], threading.Lock(), "transcriptions"
 
         self._build_ui()
+        self._init_tones()
         self._overlay = RecordingOverlay(self, self._rec); self._overlay.set_theme(self._theme)
         keyboard.Listener(on_press=self._press, on_release=self._release, daemon=True).start()
         if not self._key: self.after(200, self._ask_key)
@@ -338,12 +510,12 @@ class WispGerFlow(ctk.CTk):
 
         self._nav_frame = ctk.CTkFrame(self._sidebar, fg_color="transparent"); self._nav_frame.pack(fill="x", padx=8)
         self._nav_btns = {}
-        for vid, icon, label in [("transcriptions","\U0001f4cb","Transcriptions"),("dashboard","\U0001f4ca","Dashboard")]:
-            f = ctk.CTkFrame(self._nav_frame, fg_color="transparent", cursor="hand2"); f.pack(fill="x", pady=2)
+        for vid, icon, label in [("transcriptions","\u2302","Home"),("dashboard","\u2197","Statistics"),("voice","\u266b","My Voice")]:
+            f = ctk.CTkFrame(self._nav_frame, fg_color="transparent", cursor="hand2"); f.pack(fill="x", pady=3)
             active = vid == self._view
             fg = "#fff" if active else t["txt2"]
-            li = ctk.CTkLabel(f, text=icon, font=(F,16), width=32, text_color=fg); li.pack(side="left", padx=(4,0))
-            lt = ctk.CTkLabel(f, text=label, font=(F,12,"bold" if active else "normal"), text_color=fg)
+            li = ctk.CTkLabel(f, text=icon, font=(F,20), width=36, text_color=fg); li.pack(side="left", padx=(6,0))
+            lt = ctk.CTkLabel(f, text=label, font=(F,14,"bold" if active else "normal"), text_color=fg)
             if not self._collapsed: lt.pack(side="left", padx=(6,0))
             f.configure(fg_color=ACCENT if active else "transparent", corner_radius=8)
             for w in (f, li, lt): w.bind("<Button-1>", lambda e, v=vid: self._switch_view(v))
@@ -366,13 +538,51 @@ class WispGerFlow(ctk.CTk):
 
         self._status = StatusDot(self._sidebar, t); self._status.pack(padx=12, pady=(8,16), anchor="w")
 
+    def _days_active(self):
+        try: return (datetime.now() - datetime.fromisoformat(self._stats["first_use"])).days
+        except Exception: return 0
+
+    def _wpm(self):
+        s = self._stats
+        mins = s["total_secs"] / 60
+        return int(s["total_words"] / mins) if mins > 0 else 0
+
+    def _refresh_banner(self):
+        s = self._stats
+        self._ban_days.configure(text=f"{self._days_active()}d")
+        self._ban_words.configure(text=f"{s['total_words']:,}")
+        self._ban_wpm.configure(text=f"{self._wpm()}")
+
     def _build_content(self, t):
-        banner = ctk.CTkFrame(self._right, fg_color=t["bg2"], corner_radius=0, height=40)
+        banner = ctk.CTkFrame(self._right, fg_color=t["bg2"], corner_radius=0, height=62)
         banner.pack(fill="x"); banner.pack_propagate(False); self._banner = banner
         self._banner_sep = ctk.CTkFrame(banner, fg_color=t["border"], height=1)
         self._banner_sep.pack(fill="x", side="bottom")
-        self._hint_lbl = ctk.CTkLabel(banner, text="Hold  Ctrl + Win  to record   \u2022   Release to transcribe & paste",
-                                      font=(F,10), text_color=t["dim"]); self._hint_lbl.pack(expand=True)
+
+        # Left: hotkey hint
+        self._hint_lbl = ctk.CTkLabel(banner, text="Ctrl+Win to record", font=(F,10), text_color=t["dim"])
+        self._hint_lbl.pack(side="left", padx=(16,0))
+
+        # Right: quick stats with emoji icons
+        stats_f = ctk.CTkFrame(banner, fg_color="transparent")
+        stats_f.pack(side="right", padx=16)
+        s = self._stats
+
+        from PIL import Image, ImageTk
+        self._emoji_imgs = []  # prevent garbage collection
+        for img_name, val, label, attr in [
+            ("fire", f"{self._days_active()}d", "Active", "_ban_days"),
+            ("rocket", f"{s['total_words']:,}", "Words", "_ban_words"),
+            ("trophy", f"{self._wpm()}", "WPM", "_ban_wpm"),
+        ]:
+            img = Image.open(APP_DIR / "fonts" / f"{img_name}.png")
+            photo = ImageTk.PhotoImage(img)
+            self._emoji_imgs.append(photo)
+            tk.Label(stats_f, image=photo, bg=t["bg2"], bd=0).pack(side="left", padx=(18,4))
+            lbl = ctk.CTkLabel(stats_f, text=val, font=(F,12,"bold"), text_color=t["txt2"])
+            lbl.pack(side="left", padx=(0,3))
+            ctk.CTkLabel(stats_f, text=label, font=(F,9), text_color=t["dim"]).pack(side="left")
+            setattr(self, attr, lbl)
 
         self._tx_frame = ctk.CTkScrollableFrame(self._right, fg_color=t["bg"], scrollbar_button_color=t["border"], corner_radius=0)
         self._tx_frame.pack(fill="both", expand=True)
@@ -387,6 +597,9 @@ class WispGerFlow(ctk.CTk):
         self._dash_container = tk.Frame(self._right, bg=t["bg"])
         self._dash_frame = self._mk_scroll(self._dash_container, t["bg"])
 
+        self._voice_container = tk.Frame(self._right, bg=t["bg"])
+        self._voice_frame = self._mk_scroll(self._voice_container, t["bg"])
+
         self._bot = ctk.CTkFrame(self._right, fg_color=t["bg2"], corner_radius=0, height=32)
         self._bot.pack(fill="x", side="bottom"); self._bot.pack_propagate(False)
         self._bot_sep = ctk.CTkFrame(self._bot, fg_color=t["border"], height=1); self._bot_sep.pack(fill="x", side="top")
@@ -394,6 +607,7 @@ class WispGerFlow(ctk.CTk):
         self._count = ctk.CTkLabel(self._bot, text=f"{self._stats['total_txns']} transcriptions", font=(F,9), text_color=t["dim"])
         self._count.pack(side="right", padx=16)
         self._build_dashboard(t)
+        self._build_voice_tab(t)
 
     # ---------------------------------------------------------------- Dashboard
     def _build_dashboard(self, t):
@@ -420,17 +634,23 @@ class WispGerFlow(ctk.CTk):
             self._hero_widgets.append(v)
             Tooltip(c, hero_tips[col])
 
+        # Filler words card — single card, icon left, count right
         fc = ctk.CTkFrame(d, fg_color=t["card"], corner_radius=12, border_width=1, border_color=t["border"])
-        fc.pack(fill="x", padx=16, pady=8)
-        ff = ctk.CTkFrame(fc, fg_color="transparent"); ff.pack(fill="x", padx=16, pady=16)
-        ctk.CTkLabel(ff, text=str(s["fillers"]), font=(F,32,"bold"), text_color=ACCENT).pack(side="left")
-        fl = ctk.CTkFrame(ff, fg_color="transparent"); fl.pack(side="left", padx=(16,0))
-        ctk.CTkLabel(fl, text="Filler Words Caught", font=(F,13), text_color=t["txt"]).pack(anchor="w")
-        ctk.CTkLabel(fl, text="Ums, uhs, and waffle removed from your speech", font=(F,10), text_color=t["txt2"]).pack(anchor="w")
-        Tooltip(fc, "Tracks filler words like 'um', 'uh', 'like', 'basically', etc. detected in your transcriptions")
+        fc.pack(fill="x", padx=16, pady=(0,8))
+        ff = ctk.CTkFrame(fc, fg_color="transparent"); ff.pack(fill="x", padx=16, pady=14)
+        ctk.CTkLabel(ff, text="\U0001f6ab", font=(F,22), text_color=ACCENT).pack(side="left")
+        ctk.CTkLabel(ff, text="Filler Words Caught", font=(F,12), text_color=t["txt"]).pack(side="left", padx=(10,0))
+        ctk.CTkLabel(ff, text=str(s["fillers"]), font=(F,20,"bold"), text_color=t["txt"]).pack(side="right")
+        bd = s.get("filler_breakdown", {})
+        if bd:
+            top = sorted(bd.items(), key=lambda x: -x[1])[:8]
+            breakdown = " \u2022 ".join(f'"{w}" \u00d7{c}' for w, c in top)
+            tip = f"Top fillers: {breakdown}"
+        else:
+            tip = "No filler words caught yet"
+        Tooltip(fc, tip)
 
         # Achievements
-        BADGE_H = 200  # fixed height for all badges
         cur_section = None
         grid_frame = badge_list = None
         for aid, atype, target, icon, name, sub, tier in ACHIEVEMENTS:
@@ -447,19 +667,18 @@ class WispGerFlow(ctk.CTk):
             unlocked = aid in s.get("unlocked",[])
 
             b = ctk.CTkFrame(grid_frame, fg_color=t["card"], corner_radius=12, border_width=1,
-                             border_color=TIER_COL[tier] if unlocked else t["border"], height=BADGE_H)
+                             border_color=TIER_COL[tier] if unlocked else t["border"])
             b.grid(row=row, column=col, padx=8, pady=8, sticky="nsew")
-            b.pack_propagate(False)
-            grid_frame.rowconfigure(row, minsize=BADGE_H)
             dim = t["txt"] if unlocked else t["dim"]
-            ctk.CTkLabel(b, text=icon, font=(F,32), text_color=TIER_COL[tier] if unlocked else t["dim"]).pack(pady=(16,6))
-            ctk.CTkLabel(b, text=name, font=(F,13,"bold"), text_color=dim).pack(pady=(0,2))
-            ctk.CTkLabel(b, text=sub, font=(F,8), text_color=t["dim"]).pack(pady=(0,4))
+            # Tier badge top-right
             ctk.CTkLabel(b, text=tier.upper(), font=(F,7,"bold"), text_color="#fff",
-                         fg_color=TIER_COL[tier], corner_radius=4, width=50, height=16).pack(pady=(4,0))
-            pb = ctk.CTkProgressBar(b, width=100, height=6, corner_radius=3, progress_color=TEAL, fg_color=t["border"])
-            pb.pack(pady=(8,4)); pb.set(min(progress, 1.0))
-            ctk.CTkLabel(b, text=count_text, font=(F,9), text_color=t["dim"]).pack(pady=(0,16))
+                         fg_color=TIER_COL[tier], corner_radius=4, width=50, height=16).pack(anchor="e", padx=10, pady=(8,0))
+            ctk.CTkLabel(b, text=icon, font=(F,38), text_color=TIER_COL[tier] if unlocked else t["dim"]).pack(pady=(2,2))
+            ctk.CTkLabel(b, text=name, font=(F,15,"bold"), text_color=dim).pack()
+            ctk.CTkLabel(b, text=sub, font=(F,8), text_color=t["dim"]).pack()
+            pb = ctk.CTkProgressBar(b, height=10, corner_radius=5, progress_color=TEAL, fg_color=t["border"])
+            pb.pack(fill="x", padx=16, pady=(6,3)); pb.set(min(progress, 1.0))
+            ctk.CTkLabel(b, text=count_text, font=(F,9), text_color=t["dim"]).pack(pady=(0,10))
             hint = ACH_HINTS.get(atype, "").format(target=target)
             if unlocked: hint = f"\u2713 Unlocked!\n{hint}"
             Tooltip(b, hint)
@@ -492,6 +711,150 @@ class WispGerFlow(ctk.CTk):
             self._hero_widgets[1].configure(text=f"{s['total_secs']/60:.0f} min")
             self._hero_widgets[2].configure(text=str(s['total_txns']))
 
+    # ---------------------------------------------------------------- My Voice Tab
+    def _build_voice_tab(self, t):
+        d = self._voice_frame
+        vp = self._vp
+
+        # Profile strength
+        txns = self._stats.get("total_txns", 0)
+        strength = min(txns / 100, 1.0)
+        strength_text = f"Profile trained ({txns}+ transcriptions)" if strength >= 1.0 else f"Learning... {txns} transcriptions"
+
+        sc = ctk.CTkFrame(d, fg_color=t["card"], corner_radius=12, border_width=1, border_color=t["border"])
+        sc.pack(fill="x", padx=16, pady=(16,8))
+        sf = ctk.CTkFrame(sc, fg_color="transparent"); sf.pack(fill="x", padx=16, pady=14)
+        ctk.CTkLabel(sf, text="\U0001f9e0", font=(F,20)).pack(side="left")
+        ctk.CTkLabel(sf, text=strength_text, font=(F,12), text_color=t["txt"]).pack(side="left", padx=(10,0))
+        pb = ctk.CTkProgressBar(sc, height=8, corner_radius=4, progress_color=TEAL, fg_color=t["border"])
+        pb.pack(fill="x", padx=16, pady=(0,14)); pb.set(strength)
+
+        # Top Vocabulary
+        vocab = vp.get("vocab", {})
+        ctk.CTkLabel(d, text="Top Vocabulary", font=(F,13,"bold"), text_color=t["txt"], anchor="w").pack(fill="x", padx=20, pady=(16,6))
+        vc = ctk.CTkFrame(d, fg_color=t["card"], corner_radius=12, border_width=1, border_color=t["border"])
+        vc.pack(fill="x", padx=16, pady=(0,8))
+        vf = ctk.CTkFrame(vc, fg_color="transparent"); vf.pack(fill="x", padx=16, pady=12)
+        if vocab:
+            top_vocab = sorted(vocab.items(), key=lambda x: -x[1])[:20]
+            for w, c in top_vocab:
+                chip = ctk.CTkFrame(vf, fg_color=t["border"], corner_radius=6)
+                chip.pack(side="left", padx=2, pady=2)
+                ctk.CTkLabel(chip, text=f"{w} ({c})", font=(F,9), text_color=t["txt"], padx=8, pady=2).pack()
+        else:
+            ctk.CTkLabel(vf, text="\U0001f4a1", font=(F,16)).pack(side="left")
+            ef = ctk.CTkFrame(vf, fg_color="transparent"); ef.pack(side="left", padx=(8,0))
+            ctk.CTkLabel(ef, text="Your unique words will appear here", font=(F,10), text_color=t["dim"]).pack(anchor="w")
+            ctk.CTkLabel(ef, text="e.g.  deployment (12)  \u2022  kubernetes (8)  \u2022  refactor (5)", font=(F,9), text_color=t["dim"]).pack(anchor="w")
+
+        # Common Phrases
+        phrases = vp.get("phrases", {})
+        ctk.CTkLabel(d, text="Common Phrases", font=(F,13,"bold"), text_color=t["txt"], anchor="w").pack(fill="x", padx=20, pady=(12,6))
+        pc = ctk.CTkFrame(d, fg_color=t["card"], corner_radius=12, border_width=1, border_color=t["border"])
+        pc.pack(fill="x", padx=16, pady=(0,8))
+        if phrases:
+            top_phrases = sorted(phrases.items(), key=lambda x: -x[1])[:10]
+            for p, c in top_phrases:
+                pf = ctk.CTkFrame(pc, fg_color="transparent"); pf.pack(fill="x", padx=16, pady=3)
+                ctk.CTkLabel(pf, text=f'"{p}"', font=(F,10), text_color=t["txt"]).pack(side="left")
+                ctk.CTkLabel(pf, text=f"\u00d7{c}", font=(F,9,"bold"), text_color=t["txt2"]).pack(side="right")
+        else:
+            ef = ctk.CTkFrame(pc, fg_color="transparent"); ef.pack(fill="x", padx=16, pady=12)
+            ctk.CTkLabel(ef, text="\U0001f50d", font=(F,16)).pack(side="left")
+            pef = ctk.CTkFrame(ef, fg_color="transparent"); pef.pack(side="left", padx=(8,0))
+            ctk.CTkLabel(pef, text="Repeated phrases will be detected automatically", font=(F,10), text_color=t["dim"]).pack(anchor="w")
+            ctk.CTkLabel(pef, text='e.g.  "at the end of the day" \u00d78  \u2022  "in terms of" \u00d75', font=(F,9), text_color=t["dim"]).pack(anchor="w")
+
+        # Corrections
+        corrections = vp.get("corrections", {})
+        ctk.CTkLabel(d, text="Corrections", font=(F,13,"bold"), text_color=t["txt"], anchor="w").pack(fill="x", padx=20, pady=(12,6))
+        cc = ctk.CTkFrame(d, fg_color=t["card"], corner_radius=12, border_width=1, border_color=t["border"])
+        cc.pack(fill="x", padx=16, pady=(0,8))
+        if corrections:
+            for wrong, right in corrections.items():
+                cf = ctk.CTkFrame(cc, fg_color="transparent"); cf.pack(fill="x", padx=16, pady=3)
+                ctk.CTkLabel(cf, text=wrong, font=(F,10), text_color=RED).pack(side="left")
+                ctk.CTkLabel(cf, text="\u2192", font=(F,10), text_color=t["dim"]).pack(side="left", padx=8)
+                ctk.CTkLabel(cf, text=right, font=(F,10,"bold"), text_color=TEAL).pack(side="left")
+                def _del(w=wrong):
+                    del self._vp["corrections"][w]; _save_cfg({"voice_profile": self._vp})
+                    self._rebuild_voice_tab()
+                ctk.CTkButton(cf, text="\u2715", width=24, height=24, corner_radius=4, font=(F,10),
+                              fg_color="transparent", hover_color=t["border"], text_color=t["dim"],
+                              command=_del).pack(side="right")
+        else:
+            ef = ctk.CTkFrame(cc, fg_color="transparent"); ef.pack(fill="x", padx=16, pady=12)
+            ctk.CTkLabel(ef, text="\u270f", font=(F,16)).pack(side="left")
+            cef = ctk.CTkFrame(ef, fg_color="transparent"); cef.pack(side="left", padx=(8,0))
+            ctk.CTkLabel(cef, text="Teach Whisper your terminology", font=(F,10), text_color=t["dim"]).pack(anchor="w")
+            ctk.CTkLabel(cef, text='e.g.  "pie test" \u2192 pytest  \u2022  "cube control" \u2192 kubectl', font=(F,9), text_color=t["dim"]).pack(anchor="w")
+
+        # Add correction button
+        add_f = ctk.CTkFrame(cc, fg_color="transparent"); add_f.pack(fill="x", padx=16, pady=(4,12))
+        self._cor_wrong = ctk.CTkEntry(add_f, width=120, height=28, font=(F,10), placeholder_text="Whisper hears...",
+                                       fg_color=t["bg"], border_color=t["border"], text_color=t["txt"])
+        self._cor_wrong.pack(side="left")
+        ctk.CTkLabel(add_f, text="\u2192", font=(F,10), text_color=t["dim"]).pack(side="left", padx=6)
+        self._cor_right = ctk.CTkEntry(add_f, width=120, height=28, font=(F,10), placeholder_text="You mean...",
+                                       fg_color=t["bg"], border_color=t["border"], text_color=t["txt"])
+        self._cor_right.pack(side="left")
+        ctk.CTkButton(add_f, text="Add", width=50, height=28, corner_radius=6, font=(F,10,"bold"),
+                      fg_color=ACCENT, hover_color=ACCENTH, command=self._add_correction).pack(side="left", padx=(8,0))
+
+        # Style Notes
+        ctk.CTkLabel(d, text="Style Notes", font=(F,13,"bold"), text_color=t["txt"], anchor="w").pack(fill="x", padx=20, pady=(12,6))
+        self._style_box = ctk.CTkTextbox(d, height=60, font=(F,10), fg_color=t["card"], border_color=t["border"],
+                                         text_color=t["txt"], corner_radius=12, border_width=1)
+        self._style_box.pack(fill="x", padx=16, pady=(0,8))
+        if vp.get("style_notes"): self._style_box.insert("1.0", vp["style_notes"])
+        ctk.CTkButton(d, text="Save Notes", width=100, height=28, corner_radius=6, font=(F,10,"bold"),
+                      fg_color=ACCENT, hover_color=ACCENTH, command=self._save_style_notes).pack(anchor="e", padx=16, pady=(0,8))
+
+        # Prompt Preview
+        ctk.CTkLabel(d, text="Prompt Preview", font=(F,13,"bold"), text_color=t["txt"], anchor="w").pack(fill="x", padx=20, pady=(12,6))
+        prompt = self._build_whisper_prompt()
+        word_count = len(prompt.split())
+        prev_c = ctk.CTkFrame(d, fg_color=t["card"], corner_radius=12, border_width=1, border_color=t["border"])
+        prev_c.pack(fill="x", padx=16, pady=(0,8))
+        ctk.CTkLabel(prev_c, text=prompt if prompt else "Default prompt (no profile data yet)", font=(F,9),
+                     text_color=t["txt2"], wraplength=400, justify="left", anchor="w").pack(fill="x", padx=16, pady=(12,4))
+        ctk.CTkLabel(prev_c, text=f"~{word_count} / 150 words", font=(F,8), text_color=t["dim"]).pack(anchor="e", padx=16, pady=(0,10))
+
+        # Reset button
+        ctk.CTkButton(d, text="Reset Voice Profile", width=140, height=32, corner_radius=8, font=(F,10),
+                      fg_color=RED, hover_color=REDDIM, text_color="#fff",
+                      command=self._reset_voice_profile).pack(pady=16)
+
+    def _add_correction(self):
+        w = self._cor_wrong.get().strip()
+        r = self._cor_right.get().strip()
+        if w and r:
+            self._vp.setdefault("corrections", {})[w.lower()] = r
+            _save_cfg({"voice_profile": self._vp})
+            self._rebuild_voice_tab()
+
+    def _save_style_notes(self):
+        self._vp["style_notes"] = self._style_box.get("1.0", "end").strip()
+        _save_cfg({"voice_profile": self._vp})
+
+    def _reset_voice_profile(self):
+        self._vp = _default_voice_profile()
+        _save_cfg({"voice_profile": self._vp})
+        self._rebuild_voice_tab()
+
+    def _rebuild_voice_tab(self):
+        if hasattr(self, '_voice_container'):
+            vis = self._view == "voice"
+            if vis: self._voice_container.pack_forget()
+            # Unbind global mousewheel before destroying to prevent stale canvas references
+            try: self.unbind_all("<MouseWheel>")
+            except Exception: pass
+            self._voice_container.destroy()
+            self._voice_container = tk.Frame(self._right, bg=self._theme["bg"])
+            self._voice_frame = self._mk_scroll(self._voice_container, self._theme["bg"])
+            self._build_voice_tab(self._theme)
+            if vis: self._voice_container.pack(fill="both", expand=True, before=self._bot)
+
     # ---------------------------------------------------------------- Views
     def _switch_view(self, view):
         if view == self._view: return
@@ -500,14 +863,18 @@ class WispGerFlow(ctk.CTk):
             a = vid == view
             w["frame"].configure(fg_color=ACCENT if a else "transparent")
             w["icon"].configure(text_color="#fff" if a else t["txt2"])
-            w["label"].configure(text_color="#fff" if a else t["txt2"], font=(F,12,"bold" if a else "normal"))
+            w["label"].configure(text_color="#fff" if a else t["txt2"], font=(F,14,"bold" if a else "normal"))
+        # Hide all content frames
+        for f in (self._tx_frame, self._dash_container, self._voice_container): f.pack_forget()
+        # Show the selected one
         if view == "transcriptions":
-            self._dash_container.pack_forget()
             self._tx_frame.pack(fill="both", expand=True, before=self._bot)
-        else:
+        elif view == "dashboard":
             self._refresh_dashboard()
-            self._tx_frame.pack_forget()
             self._dash_container.pack(fill="both", expand=True, before=self._bot)
+        elif view == "voice":
+            self._rebuild_voice_tab()
+            self._voice_container.pack(fill="both", expand=True, before=self._bot)
 
     # ---------------------------------------------------------------- Sidebar
     def _toggle_sidebar(self):
@@ -537,6 +904,13 @@ class WispGerFlow(ctk.CTk):
         self._banner.configure(fg_color=t["bg2"])
         self._banner_sep.configure(fg_color=t["border"])
         self._hint_lbl.configure(text_color=t["dim"])
+        self._ban_days.configure(text_color=t["txt2"])
+        self._ban_words.configure(text_color=t["txt2"])
+        self._ban_wpm.configure(text_color=t["txt2"])
+        # Update emoji image label backgrounds
+        for w in self._banner.winfo_children():
+            for ch in (w.winfo_children() if hasattr(w, 'winfo_children') else []):
+                if isinstance(ch, tk.Label) and ch.cget("image"): ch.configure(bg=t["bg2"])
         self._tx_frame.configure(fg_color=t["bg"])
         self._bot.configure(fg_color=t["bg2"])
         self._bot_sep.configure(fg_color=t["border"])
@@ -555,35 +929,57 @@ class WispGerFlow(ctk.CTk):
                 w["icon"].configure(text_color=t["txt2"])
                 w["label"].configure(text_color=t["txt2"])
 
-        # Transcription cards
+        # Transcription cards — update card and all text labels inside
         for card in self._cards:
             card.configure(fg_color=t["card"], border_color=t["border"])
+            for w in card.winfo_children():
+                if isinstance(w, ctk.CTkFrame):
+                    for ch in w.winfo_children():
+                        if isinstance(ch, ctk.CTkLabel):
+                            tc = ch.cget("text_color")
+                            if tc not in (ACCENT, "#fff", "#ffffff") and ch.cget("fg_color") != TEAL:
+                                ch.configure(text_color=t["txt2"])
+                elif isinstance(w, ctk.CTkLabel):
+                    tc = w.cget("text_color")
+                    if tc not in (ACCENT, "#fff", "#ffffff") and w.cget("fg_color") != TEAL:
+                        w.configure(text_color=t["txt"])
 
         # Empty state
         if self._empty:
             for w in self._empty.winfo_children():
                 if isinstance(w, ctk.CTkLabel): w.configure(text_color=t["dim"])
 
-        # Dashboard — rebuild in background (native tk.Frame, fast)
-        vis = self._view == "dashboard"
-        if vis: self._dash_container.pack_forget()
-        self._dash_container.destroy()
-        self._dash_container = tk.Frame(self._right, bg=t["bg"])
-        self._dash_frame = self._mk_scroll(self._dash_container, t["bg"])
-        self._build_dashboard(t)
-        if vis: self._dash_container.pack(fill="both", expand=True, before=self._bot)
+        # Rebuild dashboard and voice tab with new theme
+        try: self.unbind_all("<MouseWheel>")
+        except Exception: pass
+        for attr, builder in [("_dash_container", "_build_dashboard"), ("_voice_container", "_build_voice_tab")]:
+            container = getattr(self, attr)
+            vis = self._view == {"_dash_container":"dashboard","_voice_container":"voice"}[attr]
+            if vis: container.pack_forget()
+            container.destroy()
+            new_container = tk.Frame(self._right, bg=t["bg"])
+            setattr(self, attr, new_container)
+            frame_attr = attr.replace("container", "frame")
+            setattr(self, frame_attr, self._mk_scroll(new_container, t["bg"]))
+            getattr(self, builder)(t)
+            if vis: new_container.pack(fill="both", expand=True, before=self._bot)
 
     # ---------------------------------------------------------------- Stats
     def _update_stats(self, text, dur):
         s, words = self._stats, text.split()
         wc = len(words); lw = [w.lower().strip(".,!?;:") for w in words]
         s["total_words"] += wc; s["total_txns"] += 1; s["total_secs"] += dur
-        s["fillers"] += sum(1 for w in lw if w in FILLERS)
+        bd = s.get("filler_breakdown", {})
+        for w in lw:
+            if w in FILLERS:
+                s["fillers"] += 1
+                bd[w] = bd.get(w, 0) + 1
+        s["filler_breakdown"] = bd
         s["like_count"] = s.get("like_count",0) + lw.count("like")
         s["um_count"] = s.get("um_count",0) + sum(1 for w in lw if w in ("um","uh","er","ah"))
         if wc == 1: s["tiny_count"] = s.get("tiny_count",0) + 1
-        if wc >= 200: s["speed_count"] = s.get("speed_count",0) + 1
-        if dur >= 60: s["long_count"] = s.get("long_count",0) + 1
+        if wc >= 100: s["speed_count"] = s.get("speed_count",0) + 1
+        if dur >= 30: s["long_count"] = s.get("long_count",0) + 1
         h = datetime.now().hour
         if h < 7: s["morning_count"] = s.get("morning_count",0) + 1
         if h < 5: s["night_count"] = s.get("night_count",0) + 1
@@ -599,6 +995,7 @@ class WispGerFlow(ctk.CTk):
         s["unlocked"] = list(unlocked)
         _save_cfg({"stats": s})
         self._count.configure(text=f"{s['total_txns']} transcription{'s' if s['total_txns']!=1 else ''}")
+        self._refresh_banner()
         for a in new: self.after(500, lambda x=a: self._toast(x))
 
     def _toast(self, ach):
@@ -607,6 +1004,78 @@ class WispGerFlow(ctk.CTk):
         t.place(relx=0.5, rely=0.95, anchor="s")
         ctk.CTkLabel(t, text=f"{icon}  Achievement Unlocked: {name}", font=(F,12,"bold"), text_color="#fff").pack(padx=20, pady=10)
         self.after(4000, t.destroy)
+
+    # ---------------------------------------------------------------- Voice Profile
+    def _update_voice_profile(self, text):
+        vp = self._vp
+        words = [w.lower().strip(".,!?;:\"'") for w in text.split() if len(w) > 2]
+
+        # Update vocab — only uncommon words
+        vocab = vp.get("vocab", {})
+        for w in words:
+            if w not in COMMON_WORDS and w not in FILLERS:
+                vocab[w] = vocab.get(w, 0) + 1
+        # Cap at 200 entries
+        if len(vocab) > 200:
+            vocab = dict(sorted(vocab.items(), key=lambda x: -x[1])[:200])
+        vp["vocab"] = vocab
+
+        # Update phrases — bigrams and trigrams
+        phrases = vp.get("phrases", {})
+        for n in (2, 3):
+            for i in range(len(words) - n + 1):
+                phrase = " ".join(words[i:i+n])
+                if not any(w in COMMON_WORDS for w in words[i:i+n]):
+                    phrases[phrase] = phrases.get(phrase, 0) + 1
+        # Keep only phrases seen 2+ times, cap at 100
+        phrases = {k: v for k, v in phrases.items() if v >= 2}
+        if len(phrases) > 100:
+            phrases = dict(sorted(phrases.items(), key=lambda x: -x[1])[:100])
+        vp["phrases"] = phrases
+
+        # Decay every 50 transcriptions
+        s = self._stats
+        if s["total_txns"] > 0 and s["total_txns"] % 50 == 0:
+            for d in (vp["vocab"], vp["phrases"]):
+                for k in list(d):
+                    d[k] = round(d[k] * 0.8, 1)
+                    if d[k] < 1: del d[k]
+
+        _save_cfg({"voice_profile": vp})
+
+    def _build_whisper_prompt(self):
+        vp = self._vp
+        # Full override if set
+        if vp.get("prompt_override", "").strip():
+            return vp["prompt_override"][:600]
+
+        parts = []
+        # Style notes
+        notes = vp.get("style_notes", "").strip()
+        if notes: parts.append(notes[:200])
+
+        # Top correction targets (just the correct forms as vocabulary hints)
+        corrections = vp.get("corrections", {})
+        if corrections:
+            parts.append(", ".join(corrections.values())[:100])
+
+        # Top vocab words
+        vocab = vp.get("vocab", {})
+        if vocab:
+            top = sorted(vocab.items(), key=lambda x: -x[1])[:25]
+            parts.append(", ".join(w for w, _ in top))
+
+        # Top phrases as natural fragments
+        phrases = vp.get("phrases", {})
+        if phrases:
+            top = sorted(phrases.items(), key=lambda x: -x[1])[:8]
+            parts.append(". ".join(p for p, _ in top))
+
+        prompt = ". ".join(parts) if parts else WHISPER_PROMPT
+        # Cap at ~150 words
+        words = prompt.split()
+        if len(words) > 150: prompt = " ".join(words[:150])
+        return prompt
 
     # ---------------------------------------------------------------- Cards
     def _add_card(self, text, dur):
@@ -619,12 +1088,47 @@ class WispGerFlow(ctk.CTk):
     # ---------------------------------------------------------------- Hotkey
     MIN_RECORDING_SECS = 0.3
 
+    @staticmethod
+    def _make_tone(freq, ms, vol=0.12):
+        """Generate a sine wave WAV file in temp dir. Returns file path."""
+        import tempfile
+        sr = 22050
+        n = int(sr * ms / 1000)
+        fade = min(n // 4, 200)
+        pcm = []
+        for i in range(n):
+            s = math.sin(2 * math.pi * freq * i / sr) * vol
+            if i < fade: s *= i / fade
+            elif i > n - fade: s *= (n - i) / fade
+            pcm.append(int(s * 32767))
+        path = os.path.join(tempfile.gettempdir(), f"wispger_{freq}.wav")
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+            w.writeframes(struct.pack(f"<{n}h", *pcm))
+        return path
+
+    def _init_tones(self):
+        """Pre-generate start/stop tones at startup."""
+        self._tone_start = self._make_tone(880, 60)
+        self._tone_stop = self._make_tone(660, 40)
+
+    def _beep(self, tone_path):
+        """Play a pre-generated tone file. Non-blocking, instant."""
+        try:
+            if IS_WIN:
+                import winsound
+                winsound.PlaySound(tone_path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+            elif IS_MAC:
+                subprocess.Popen(["afplay", tone_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception: pass
+
     def _press(self, key):
         with self._key_lock:
             if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r): self._ctrl = True
             elif key in (keyboard.Key.cmd, keyboard.Key.cmd_r): self._win = True
             if self._ctrl and self._win and not self._recording:
                 self._recording, self._t0 = True, time.time()
+                self._beep(self._tone_start)
                 self._rec.start(); self.after(0, self._status.recording); self.after(0, self._overlay.show)
 
     def _release(self, key):
@@ -635,6 +1139,7 @@ class WispGerFlow(ctk.CTk):
             if both and self._recording and not (self._ctrl and self._win):
                 self._recording = False; dur = time.time()-self._t0 if self._t0 else 0.0
                 pcm = self._rec.stop()
+                self._beep(self._tone_stop)
                 self.after(0, self._overlay.hide)
                 if not pcm or dur < self.MIN_RECORDING_SECS:
                     self.after(0, self._status.ready); return
@@ -649,20 +1154,25 @@ class WispGerFlow(ctk.CTk):
         try:
             resp = requests.post(GROQ_URL, headers={"Authorization": f"Bearer {self._key}"},
                 files={"file": ("audio.wav", self._rec.to_wav(pcm), "audio/wav")},
-                data={"model": GROQ_MODEL, "language": self._lang, "response_format": "json"}, timeout=15)
+                data={"model": GROQ_MODEL, "language": self._lang, "response_format": "json",
+                      "prompt": self._build_whisper_prompt()}, timeout=15)
             if resp.status_code == 401:
                 self.after(0, lambda: self._status.error("Invalid API key"))
                 self.after(3000, self._status.ready); return
             resp.raise_for_status()
-            text = resp.json().get("text","").strip()
-            if not text:
+            raw = resp.json().get("text","").strip()
+            if not raw or raw.lower().strip(".!? ") in _HALLUCINATIONS:
                 self.after(0, self._status.ready); return
+            text = clean_pipeline(raw)
+            text = _apply_corrections(text, self._vp.get("corrections", {}))
+            paste_text = prep_for_paste(text)  # add leading space for seamless paste
             print(f"[{dur:.1f}s] {text}")
-            pyperclip.copy(text); time.sleep(0.15)
+            pyperclip.copy(paste_text); time.sleep(0.15)
             self._kb.press(keyboard.Key.ctrl); self._kb.press("v")
             self._kb.release("v"); self._kb.release(keyboard.Key.ctrl)
             self.after(0, lambda: self._add_card(text, dur))
             self.after(0, lambda: self._update_stats(text, dur))
+            self.after(0, lambda: self._update_voice_profile(text))
             self.after(0, self._status.ready)
         except requests.Timeout:
             self.after(0, lambda: self._status.error("Timed out"))
