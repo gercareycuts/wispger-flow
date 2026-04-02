@@ -19,7 +19,7 @@ a = Analysis(
         'pynput', 'pynput.keyboard', 'pynput.keyboard._win32',
     ],
     excludes=[
-        'torch', 'torchaudio', 'torchvision',
+        'numpy', 'torch', 'torchaudio', 'torchvision',
         'faster_whisper', 'ctranslate2',
         'matplotlib', 'PIL', 'scipy', 'pandas',
         'IPython', 'jupyter', 'notebook',
