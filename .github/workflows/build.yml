@@ -2,11 +2,24 @@ name: Build WispGer Flow
 
 on:
   push:
-    branches: [cloud-groq]
+    branches: [master, cloud-groq]
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install customtkinter pyperclip requests sounddevice pynput pillow pytest
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
   build:
+    needs: test
     strategy:
       matrix:
         include:
