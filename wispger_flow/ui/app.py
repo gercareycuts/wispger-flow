@@ -71,11 +71,13 @@ class WispGerFlow(ctk.CTk):
         # Pre-render achievement emoji in background
         self._ach_photos = {}
         self._emoji_ready = False
+        self._emoji_rendered = threading.Event()
         def _load_emoji():
             if not _ACH_EMOJI_CACHE:
                 render_emoji_images()
-            self.after(0, self._convert_emoji)
+            self._emoji_rendered.set()
         threading.Thread(target=_load_emoji, daemon=True).start()
+        self._poll_emoji()
 
         self._build_ui()
         self._load_history()
@@ -86,13 +88,16 @@ class WispGerFlow(ctk.CTk):
         if not self._key:
             self.after(200, self._ask_key)
 
-    def _convert_emoji(self):
-        """Convert PIL images to PhotoImage on main thread (called once emoji render is done)."""
-        from PIL import ImageTk
-        for char, pil_img in _ACH_EMOJI_CACHE.items():
-            if pil_img:
-                self._ach_photos[char] = ImageTk.PhotoImage(pil_img)
-        self._emoji_ready = True
+    def _poll_emoji(self):
+        """Poll until background emoji rendering is done, then convert on main thread."""
+        if self._emoji_rendered.is_set():
+            from PIL import ImageTk
+            for char, pil_img in _ACH_EMOJI_CACHE.items():
+                if pil_img:
+                    self._ach_photos[char] = ImageTk.PhotoImage(pil_img)
+            self._emoji_ready = True
+        else:
+            self.after(100, self._poll_emoji)
 
     def destroy(self):
         storage.flush_now()
