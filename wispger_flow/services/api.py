@@ -1,6 +1,7 @@
 """Groq Whisper API client and audio recording."""
 
 import array
+import collections
 import io
 import math
 import threading
@@ -19,37 +20,64 @@ _session = requests.Session()
 
 
 class AudioRecorder:
-    """Thread-safe audio recorder using sounddevice."""
+    """Thread-safe audio recorder with 500ms pre-buffer using sounddevice."""
     RATE = 16000
+    PRE_BUF_BLOCKS = 5  # 5 blocks * 100ms each = 500ms
 
     def __init__(self):
-        self._chunks, self._stream, self._lock, self.level = [], None, threading.Lock(), 0.0
-
-    def start(self):
-        with self._lock:
-            self._chunks.clear()
+        self._chunks = []
+        self._stream = None
+        self._lock = threading.Lock()
         self.level = 0.0
+        self._recording = False
+        self._pre_buf = collections.deque(maxlen=self.PRE_BUF_BLOCKS)
+
+    def begin_listening(self):
+        """Start the mic stream for passive pre-buffering. Call once at app init."""
+        if self._stream:
+            return
         self._stream = sd.RawInputStream(
             samplerate=self.RATE, channels=1, dtype="int16",
             blocksize=self.RATE // 10, callback=self._cb,
         )
         self._stream.start()
 
+    def start(self):
+        """Begin recording. Pre-buffered audio is prepended automatically."""
+        with self._lock:
+            self._chunks = list(self._pre_buf)
+            self._pre_buf.clear()
+            self._recording = True
+        self.level = 0.0
+        # If stream isn't running yet (no begin_listening call), start it
+        if not self._stream:
+            self.begin_listening()
+
     def stop(self):
+        """Stop recording and return PCM data. Mic stays open for pre-buffering."""
+        with self._lock:
+            self._recording = False
+            data = b"".join(self._chunks)
+            self._chunks.clear()
+        self.level = 0.0
+        return data
+
+    def stop_listening(self):
+        """Shut down the mic stream entirely. Call on app exit."""
         if self._stream:
             self._stream.stop()
             self._stream.close()
             self._stream = None
+        self._recording = False
         self.level = 0.0
-        with self._lock:
-            data = b"".join(self._chunks)
-            self._chunks.clear()
-            return data
 
     def _cb(self, indata, *_):
         raw = bytes(indata)
         with self._lock:
-            self._chunks.append(raw)
+            if self._recording:
+                self._chunks.append(raw)
+            else:
+                self._pre_buf.append(raw)
         s = array.array("h", raw)
         if s:
             self.level = math.sqrt(sum(v * v for v in s[::8]) / max(len(s) // 8, 1)) / 32768.0

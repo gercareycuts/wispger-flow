@@ -85,6 +85,7 @@ class WispGerFlow(ctk.CTk):
         self._init_tones()
         self._overlay = RecordingOverlay(self, self._rec)
         self._overlay.set_theme(self._theme)
+        self._rec.begin_listening()
         keyboard.Listener(on_press=self._press, on_release=self._release, daemon=True).start()
         if not self._key:
             self.after(200, self._ask_key)
@@ -111,6 +112,7 @@ class WispGerFlow(ctk.CTk):
     def destroy(self):
         self._alive = False
         self._overlay.hide()
+        self._rec.stop_listening()
         storage.flush_now()
         super().destroy()
 
